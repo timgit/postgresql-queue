@@ -2,6 +2,7 @@ const assert = require('assert')
 const EventEmitter = require('events')
 const Promise = require('bluebird')
 const uuid = require('uuid')
+const { default: PQueue } = require('p-queue')
 
 const Worker = require('./worker')
 const plans = require('./plans')
@@ -70,6 +71,10 @@ class Manager extends EventEmitter {
   async watch (name, options, callback) {
     options.newJobCheckInterval = options.newJobCheckInterval || this.config.newJobCheckInterval
 
+    const teamQueue = options.batchSize ? null : new PQueue({ concurrency: options.teamConcurrency || 1 })
+    const teamSize = options.teamSize || 1
+    const queueSize = () => teamQueue.size + teamQueue.pending
+
     const sendItBruh = async (jobs) => {
       if (!jobs) {
         return
@@ -82,15 +87,42 @@ class Manager extends EventEmitter {
         return Promise.all([callback(jobs)]).catch(err => this.fail(jobs.map(job => job.id), err))
       }
 
-      const concurrency = options.teamConcurrency || 1
+      let resolveWorker
+      const continueWorker = new Promise(resolve => { resolveWorker = resolve })
 
-      // either no option was set, or teamSize was used
-      return Promise.map(jobs, job =>
-        callback(job)
-          .then(value => this.complete(job.id, value))
-          .catch(err => this.fail(job.id, err))
-      , { concurrency }
-      ).catch(() => {}) // allow promises & non-promises to live together in harmony
+      // Resume the worker loop only when there's a minimum number of jobs ready
+      // or on first job if no minimum is specified
+      // (or if there's nothing in the queue so we don't jam on bad input)
+      const nextJobHandler = () => {
+        const pending = queueSize()
+        if (!options.teamMinimumFetch ||
+          !pending ||
+          (teamSize - pending) > options.teamMinimumFetch) {
+          resolveWorker()
+          teamQueue.off('next', nextJobHandler)
+        }
+      }
+
+      teamQueue.on('next', nextJobHandler)
+
+      jobs.forEach(job =>
+        teamQueue.add(async () => {
+          try {
+            const result = callback(job)
+
+            // If the caller returns a promise
+            if (typeof (result || {}).then === 'function') {
+              const timeout = this.expiringJobPromise(job);
+              return Promise.race([result, timeout])
+                .then((value) => this.complete(job.id, value))
+                .catch((err) => this.fail(job.id, err))
+                .catch(() => {})
+            }
+          } catch (e) {}
+        })
+      )
+
+      return continueWorker
     }
 
     const fetchOptions = { includeMetadata: options.includeMetadata || false }
@@ -98,7 +130,7 @@ class Manager extends EventEmitter {
 
     const workerConfig = {
       name,
-      fetch: () => this.fetch(name, options.batchSize || options.teamSize || 1, fetchOptions),
+      fetch: () => this.fetch(name, options.batchSize || teamSize - queueSize(), fetchOptions),
       onFetch: jobs => sendItBruh(jobs),
       onError,
       interval: options.newJobCheckInterval
@@ -110,6 +142,24 @@ class Manager extends EventEmitter {
     if (!this.subscriptions[name]) { this.subscriptions[name] = { workers: [] } }
 
     this.subscriptions[name].workers.push(worker)
+  }
+
+  async expiringJobPromise(job) {
+    var times = {
+      // I really hope no-one is keeping a promise
+      // hanging for days
+      days: 86400000,
+      hours: 3600000,
+      minutes: 60000,
+      seconds: 1000,
+      milliseconds: 1,
+    };
+    const time = Object.keys(job.expirein).reduce((total, key) => total += times[key] * job.expirein[key], 0);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error('Job expired'));
+      }, time);
+    })
   }
 
   async unsubscribe (name) {
